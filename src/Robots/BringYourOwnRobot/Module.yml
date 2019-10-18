@@ -24,7 +24,6 @@ Items:
     Scope: all
     Type: AWS::DynamoDB::Table
     Allow: ReadWrite
-    Scope: all
     Properties:
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:

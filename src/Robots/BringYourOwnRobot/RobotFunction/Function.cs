@@ -22,6 +22,8 @@
  * SOFTWARE.
  */
 
+using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Amazon.Lambda.Core;
 using LambdaRobots.Protocol;
@@ -33,22 +35,41 @@ namespace LambdaRobots.BringYourOwnRobot.RobotFunction {
 
     public class LambdaRobotState {
 
-        // TODO: use this
+        //--- Properties ---
+        public bool Initialized { get; set; }
+        public double ScanHeading { get; set; }
+        public double LastDamage { get; set; }
+        public double? TargetRange { get; set; }
+        public double NoHitSweep { get; set; }
+        public double ScanResolution { get; set; }
+        public double? GotoX { get; set; }
+        public double? GotoY { get; set; }
+        
+        public int Diamond { get; set; }
     }
 
     public class Function : ALambdaRobotFunction<LambdaRobotState> {
+        
+        private List<(int, int)> TupleList = new List<(int, int)> {
+            (490, 990),
+            (10, 490),
+            (490, 10),
+            (990, 490)
+        }; 
+        
+        private bool WasHurt => Damage > State.LastDamage;
 
         //--- Methods ---
         public override async Task<LambdaRobotBuild> GetBuildAsync() {
             return new LambdaRobotBuild {
 
                 // TODO: give your robot a name!
-                Name = "BringYourOwnRobot",
+                Name = "T800",
 
-                Armor = LambdaRobotArmorType.Medium,
-                Engine = LambdaRobotEngineType.Economy,
-                Missile = LambdaRobotMissileType.Dart,
-                Radar = LambdaRobotRadarType.UltraShortRange
+                Armor = LambdaRobotArmorType.Heavy,
+                Engine = LambdaRobotEngineType.Standard,
+                Missile = LambdaRobotMissileType.Javelin,
+                Radar = LambdaRobotRadarType.ShortRange
             };
         }
 
@@ -58,6 +79,125 @@ namespace LambdaRobots.BringYourOwnRobot.RobotFunction {
 
             // NOTE: you can use the `State` property to fetch and store state across invocation.
             //  The `State` property is of type `LambdaRobotState`.
+
+            // check if the state object needs to be initialized
+            if(!State.Initialized) {
+                State.Initialized = true;
+
+                // initialize state
+                State.NoHitSweep = 0.0;
+                State.ScanResolution = Robot.RadarMaxResolution;
+                
+                Random rnd = new Random();
+                State.Diamond = rnd.Next(0, 3);
+
+                // initialize aim to point to middle of the game board
+                State.ScanHeading = AngleToXY(TupleList[State.Diamond].Item1, TupleList[State.Diamond].Item2);
+            }
+
+            // NOTE: HotShot will do up to 2 scans each turn. Whichever area has a hit is then targetted and the
+            //  scan resolution is halved. This has the effect of progressively refining the targeting after
+            //  each turn, similar to binary search.
+
+            // check if target is found in left scan area
+            State.TargetRange = await ScanAsync(State.ScanHeading - State.ScanResolution, State.ScanResolution);
+            if((State.TargetRange != null) && (State.TargetRange > Game.FarHitRange) && (State.TargetRange <= Robot.MissileRange)) {
+                LogInfo($"Target found: ScanHeading = {State.ScanHeading:N2}, Range = {State.TargetRange:N2}");
+
+                // update scan heading
+                State.ScanHeading -= State.ScanResolution;
+
+                // narrow scan resolution
+                State.ScanResolution = Math.Max(0.1, State.ScanResolution / 2.0);
+            } else {
+
+                // check if target is found in right scan area
+                State.TargetRange = await ScanAsync(State.ScanHeading + State.ScanResolution, State.ScanResolution);
+                if((State.TargetRange != null) && (State.TargetRange > Game.FarHitRange) && (State.TargetRange <= Robot.MissileRange)) {
+                    LogInfo($"Target found: ScanHeading = {State.ScanHeading:N2}, Range = {State.TargetRange:N2}");
+
+                    // update scan heading
+                    State.ScanHeading += State.ScanResolution;
+
+                    // narrow scan resolution
+                    State.ScanResolution = Math.Max(0.1, State.ScanResolution / 2.0);
+                } else {
+                    LogInfo($"No target found: ScanHeading = {State.ScanHeading:N2}");
+
+                    // look in adjacent area
+                    State.ScanHeading += 3.0 * Robot.RadarMaxResolution;
+
+                    // reset resolution to max resolution
+                    State.ScanResolution = Robot.RadarMaxResolution;
+
+                    // increase our no-hit sweep tracker so we know when to move
+                    State.NoHitSweep += 2.0 * Robot.RadarMaxResolution;
+                }
+            }
+            State.ScanHeading = NormalizeAngle(State.ScanHeading);
+
+            // check if a target was found that is neither too close, nor too far
+            if(State.TargetRange != null) {
+
+                // fire at target
+                FireMissile(State.ScanHeading, State.TargetRange.Value);
+
+                // reset sweep tracker to indicate we found something
+                State.NoHitSweep = 0.0;
+            }
+
+            // check if we're not moving
+            if((State.GotoX == null) || (State.GotoY == null)) {
+
+                // check if we were hurt or having found a target after a full sweep
+                if(WasHurt) {
+                    LogInfo("Damage detected. Taking evasive action.");
+
+                    // take evasive action!
+
+                    State.Diamond++;
+                    if (State.Diamond > 3) {
+                        State.Diamond = 0;
+                    }
+
+                    State.GotoX = TupleList[State.Diamond].Item1;
+                    State.GotoY = TupleList[State.Diamond].Item2;
+
+                    // State.GotoX = Game.CollisionRange + Random.NextDouble() * (Game.BoardWidth - 2.0 * Game.CollisionRange);
+                    // State.GotoY = Game.CollisionRange + Random.NextDouble() * (Game.BoardHeight - 2.0 * Game.CollisionRange);
+                    
+                } else if((State.NoHitSweep >= 360.0) && ((State.GotoX == null) || (State.GotoY == null))) {
+                    LogInfo("Nothing found in immediate surroundings. Moving to new location.");
+                    
+                    State.Diamond++;
+                    if (State.Diamond > 3) {
+                        State.Diamond = 0;
+                    }
+
+                    State.GotoX = TupleList[State.Diamond].Item1;
+                    State.GotoY = TupleList[State.Diamond].Item2;
+
+                    // time to move to a new random location on the board
+                    // State.GotoX = Game.CollisionRange + Random.NextDouble() * (Game.BoardWidth - 2.0 * Game.CollisionRange);
+                    // State.GotoY = Game.CollisionRange + Random.NextDouble() * (Game.BoardHeight - 2.0 * Game.CollisionRange);
+                }
+            }
+
+            // check if we're moving and have reached our destination
+            if((State.GotoX != null) && (State.GotoY != null)) {
+
+                // reset sweep tracker while moving
+                State.NoHitSweep = 0.0;
+
+                // stop moving once we have reached our destination
+                if(MoveToXY(State.GotoX.Value, State.GotoY.Value)) {
+                    State.GotoX = null;
+                    State.GotoY = null;
+                }
+            }
+
+            // store current damage so we can detect if we got hurt
+            State.LastDamage = Damage;
         }
     }
 }
